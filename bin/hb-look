@@ -18,15 +18,27 @@ esac
 
 out=${1:-$(mktemp --suffix=.png "${TMPDIR:-/tmp}/hb-look-XXXXXX")}
 
-wd=${HB_WAYLAND_DISPLAY:-}
-if [[ -z $wd && -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
-    wd=$(cat "$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/hb_wayland_display" 2>/dev/null || true)
+# Capture-path selection:
+#  - NESTED mode: the runner sets HB_HOST_WAYLAND_DISPLAY + HB_HOST_CAPTURE_GEOM.
+#    grim against the nested socket hangs (the aquamarine headless backend does
+#    not service wlr-screencopy - rc=124, 0 bytes), so we instead grim the host
+#    region the nested window is pinned to. Same pixels an agent would see.
+#  - HOST mode: those are unset; grim the live session directly.
+# Both paths are timeout-guarded so a future regression fails fast instead of
+# eating the whole task timeout budget.
+if [[ -n ${HB_HOST_WAYLAND_DISPLAY:-} && -n ${HB_HOST_CAPTURE_GEOM:-} ]]; then
+    timeout 8 env WAYLAND_DISPLAY="$HB_HOST_WAYLAND_DISPLAY" \
+        grim -g "$HB_HOST_CAPTURE_GEOM" "$out"
+else
+    wd=${HB_WAYLAND_DISPLAY:-}
+    if [[ -z $wd && -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+        wd=$(cat "$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/hb_wayland_display" 2>/dev/null || true)
+    fi
+    # host mode: the bench instance IS the current session
+    wd=${wd:-${WAYLAND_DISPLAY:-}}
+    [[ -n $wd ]] || { echo "hb-look: cannot determine bench WAYLAND_DISPLAY" >&2; exit 1; }
+    timeout 8 env WAYLAND_DISPLAY="$wd" grim "$out"
 fi
-# host mode: the bench instance IS the current session
-wd=${wd:-${WAYLAND_DISPLAY:-}}
-[[ -n $wd ]] || { echo "hb-look: cannot determine bench WAYLAND_DISPLAY" >&2; exit 1; }
-
-WAYLAND_DISPLAY=$wd grim "$out"
 
 case $mode in
 png) echo "$out" ;;

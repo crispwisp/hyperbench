@@ -18,7 +18,7 @@ HB_TERMINAL=${HB_TERMINAL:-alacritty}
 # the same output geometry. Best-effort: skipped when the runner is not
 # itself inside a Hyprland session.
 hb_launch_instance() {
-    local root=$1 logfile=$2 before after sig i
+    local root=$1 logfile=$2 before after sig i host_addr
     local parent_wins=""
     [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] &&
         parent_wins=$(hyprctl -j clients 2>/dev/null |
@@ -34,7 +34,12 @@ hb_launch_instance() {
                 # persist the PID: callers run us in a $() subshell, so a
                 # global variable would be lost (audit finding)
                 echo "$HB_HYPR_PID" >"$XDG_RUNTIME_DIR/hypr/$sig/hb_pid"
-                hb__pin_parent_window "$parent_wins"
+                # pin returns the host-side addr of the nested window; persist
+                # it so the runner can grim that host region (grim-on-nested
+                # hangs - see hb_host_capture_geom / computer-use-notes.md).
+                host_addr=$(hb__pin_parent_window "$parent_wins")
+                [[ -n $host_addr ]] &&
+                    printf '%s' "$host_addr" >"$XDG_RUNTIME_DIR/hypr/$sig/hb_host_addr"
                 hb_record_wayland_display "$sig"
                 echo "$sig"
                 return 0
@@ -64,6 +69,7 @@ hb__pin_parent_window() {
     hyprctl dispatch resizewindowpixel "exact 1280 800,address:$addr" >/dev/null 2>&1
     hyprctl dispatch movewindowpixel "exact 0 0,address:$addr" >/dev/null 2>&1
     sleep 0.5 # let the nested output adopt the new size
+    echo "$addr" # host-side addr: the runner grims this region (nested grim hangs)
     return 0
 }
 
@@ -84,6 +90,32 @@ hb_record_wayland_display() {
 # hb_wayland_display [SIG] - print the instance's wayland socket name.
 hb_wayland_display() {
     cat "$XDG_RUNTIME_DIR/hypr/${1:-$HYPRLAND_INSTANCE_SIGNATURE}/hb_wayland_display" 2>/dev/null
+}
+
+# hb_host_capture_geom NESTED_SIG - print the host-session geometry
+# ("<x>,<y> <w>x<h>") of the nested instance's pinned window, after pulling it
+# onto the active host workspace so the host actually composites its pixels.
+# Run from the runner/parent env (HYPRLAND_INSTANCE_SIGNATURE = host session).
+#
+# Why this exists: wlr-screencopy on the nested aquamarine HEADLESS backend
+# does not service frame-ready, so grim against the nested socket hangs (rc=124,
+# 0 bytes) the moment the instance is up - misc:vfr=false does not fix it. The
+# host session presents continuously, so we grim the host region the nested
+# window occupies instead. hb-look consumes this via HB_HOST_CAPTURE_GEOM. The
+# geometry is read back from the live host clients (NOT assumed 0,0: floating +
+# borders offset it, e.g. -2,-2) and only after the pin has settled and the
+# window has been composited on the active output.
+hb_host_capture_geom() {
+    local nsig=$1 addr ws
+    addr=$(cat "$XDG_RUNTIME_DIR/hypr/$nsig/hb_host_addr" 2>/dev/null) || return 1
+    [[ -n $addr ]] || return 1
+    ws=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id') || return 1
+    # the non-disruptive special-workspace rule would otherwise keep the window
+    # off the composited output and grim would capture stale/empty pixels
+    hyprctl dispatch movetoworkspacesilent "$ws,address:$addr" >/dev/null 2>&1 || true
+    sleep 0.3 # let it compose on the active output before reading geometry
+    hyprctl -j clients 2>/dev/null | jq -er --arg a "$addr" \
+        '.[] | select(.address == $a) | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"'
 }
 
 hb_kill_instance() {

@@ -169,6 +169,25 @@ Earned during hyprbench development, each by a real incident:
   concurrently with each other, and a bootstrapped steam answers CDP on
   port 8080 within seconds while its sign-in page target appears much
   later: gate on the target, not the endpoint.
+- **nested-grim-hangs-capture-host-side.** `grim` against a nested
+  instance's wayland socket hangs deterministically (rc=124, 0 bytes): the
+  aquamarine HEADLESS backend never services wlr-screencopy frame-ready, and
+  `misc:vfr=false` does not fix it. Proven the moment the instance is up,
+  worse once a client maps. So the vision track never actually captured a
+  frame — and headless is hit too, because `hb-look --text/--ocr` grim the
+  same dead socket (it just never fired while agents leaned on hyprctl IPC).
+  Fix: the host session presents continuously, so grim the HOST region the
+  nested window is pinned to instead. The runner persists the nested window's
+  host-side address at launch, pulls it onto the active host workspace
+  (`movetoworkspacesilent` — the non-disruptive special-ws rule otherwise
+  hides it from grim), reads the geometry back from the live host clients
+  (NOT assumed 0,0 — float + borders offset it, e.g. `-2,-2`), and exports
+  `HB_HOST_WAYLAND_DISPLAY` + `HB_HOST_CAPTURE_GEOM`; hb-look grims that
+  region when both are set, direct otherwise (host mode). Read the geom AFTER
+  the pin settles and the ws-move composites, else you capture stale pixels.
+  Timeout-guard every grab so a future regression fails fast instead of
+  eating the whole task budget. The doctor exercises this path end-to-end
+  (real PNG + a not-black std-dev check) so it can never silently rot back.
 
 ## Proposed: browser task track
 

@@ -257,6 +257,25 @@ run_suite() { # AGENT FILTER LABEL TIMEOUT_OVERRIDE OUTFILE TRACK MODE GATE_TRAC
                 PATH="$ROOT/bin:$PATH"
             )
             [[ $track == "vision" ]] && agent_env+=(HB_WAYLAND_DISPLAY="$wd")
+            # nested mode: grim against the nested socket hangs (the aquamarine
+            # headless backend never services wlr-screencopy). Hand hb-look the
+            # host display + the host region the nested window is pinned to, so
+            # it captures there instead. BOTH tracks need this: headless
+            # hb-look --text/--ocr grims the same dead socket. Geom is read back
+            # AFTER the pin settles and the window is composited on the active
+            # host ws (hb_host_capture_geom), never assumed 0,0.
+            if [[ $mode == "nested" ]]; then
+                local host_geom
+                host_geom=$(hb_host_capture_geom "$sig" 2>/dev/null || true)
+                if [[ -n $host_geom ]]; then
+                    agent_env+=(
+                        HB_HOST_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
+                        HB_HOST_CAPTURE_GEOM="$host_geom"
+                    )
+                else
+                    echo "  (warning: host-capture geom unresolved; hb-look may hang on nested)" >&2
+                fi
+            fi
             # run the agent from its scratch dir, NOT the repo: agent CLIs
             # ingest CWD context, and the repo's tasks/*.json contain the
             # oracle solutions. stdin MUST be /dev/null: the agent otherwise
@@ -400,14 +419,38 @@ doctor)
         echo "ok   nested instance ($sig)"
         wd=$(hb_wayland_display "$sig")
         echo "ok   wayland display ($wd)"
+        # Set up host-region capture exactly as the runner does. grim against
+        # the nested socket hangs (aquamarine headless backend ignores
+        # wlr-screencopy), so without this the doctor's own hb-look would wedge.
+        # This makes the doctor the end-to-end self-test for the capture path.
+        host_geom=$(hb_host_capture_geom "$sig" 2>/dev/null || true)
+        if [[ -n $host_geom ]]; then
+            export HB_HOST_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" HB_HOST_CAPTURE_GEOM="$host_geom"
+            echo "ok   host-capture geom ($host_geom)"
+        else
+            echo "FAIL host-capture geom (nested capture would hang)"; ok=0
+        fi
         shot=$(HYPRLAND_INSTANCE_SIGNATURE=$sig "$ROOT/bin/hb-look" 2>&1) &&
             file "$shot" | grep -q PNG &&
             echo "ok   screenshot ($shot, $(stat -c%s "$shot") bytes)" ||
             { echo "FAIL screenshot: $shot"; ok=0; }
+        # not-black guard: a hung/blank grab is a zero-variance image. Require
+        # real pixels via grayscale std-dev (empty nested instance ~ wallpaper,
+        # std-dev > 2; wisp's content frames measured ~14). Best-effort: only
+        # when ImageMagick is present.
+        if command -v convert >/dev/null 2>&1 && [[ -f ${shot:-} ]]; then
+            sd=$(convert "$shot" -colorspace Gray -format '%[fx:standard_deviation*255]' info: 2>/dev/null || echo 0)
+            if awk -v s="$sd" 'BEGIN{exit !(s>2)}'; then
+                echo "ok   capture not-black (std-dev $sd)"
+            else
+                echo "FAIL capture looks blank (std-dev $sd)"; ok=0
+            fi
+        fi
         HYPRLAND_INSTANCE_SIGNATURE=$sig "$ROOT/bin/hb-look" --text >/dev/null 2>&1 &&
             echo "ok   hb-look --text" || { echo "FAIL hb-look --text"; ok=0; }
         HYPRLAND_INSTANCE_SIGNATURE=$sig "$ROOT/bin/hb-look" --ocr >/dev/null 2>&1 &&
             echo "ok   hb-look --ocr" || { echo "FAIL hb-look --ocr"; ok=0; }
+        unset HB_HOST_WAYLAND_DISPLAY HB_HOST_CAPTURE_GEOM
         # hb_spawn_shell contract: the spawned shell's /proc cwd is the CWD
         # we asked for (termtopo verifiers depend on exactly this)
         cwd_want=$(mktemp -d)
